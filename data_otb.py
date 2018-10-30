@@ -2,7 +2,7 @@
 # @Author: Song Dejia
 # @Date:   2018-10-30 10:12:40
 # @Last Modified by:   Song Dejia
-# @Last Modified time: 2018-10-30 15:17:41
+# @Last Modified time: 2018-10-30 21:20:21
 import os
 import sys
 import math
@@ -11,12 +11,13 @@ import random
 import os.path as osp
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-from PIL import Image
+from PIL import Image, ImageDraw
 from torchvision.transforms import functional as F
+import torchvision.transforms as transforms
 from axis import x1y1x2y2_to_xywh, xywh_to_x1y1x2y2, x1y1wh_to_xywh, x1y1wh_to_x1y1x2y2, point_center_crop, resize, x1y1x2y2x3y3x4y4_to_x1y1wh
 
 #data_dir directly contain img / label
-data_dir = './OTB2015/otb15'
+data_dir = './OTB2015/otb15/subset'
 interval = 20
 
 list1 = os.listdir(data_dir) #OTB2015下的所有文件夹
@@ -36,7 +37,6 @@ for a in range(len(number)):
 # 序号可以看作是文件夹idx
 # number [10, 20, 50, 30]
 # sum    [0,  10, 30, 80, 110]
-
 class MyDataset(Dataset):
 
     def __init__(self, root_dir='./OTB2015/', anchor_scale = 64, k = 5, vis = False):
@@ -84,8 +84,15 @@ class MyDataset(Dataset):
         """
         从总体中选取index
         看index是来自第几个文件夹
+        exp [0, 107, 879, 1084, 1472]
+        折半查找
+        low -- 0
+        high-- 4
         """
+        length_sum = len(sum1)
+
         low = 0
+
         high = len(sum1) - 1
         while(high - low > 1):
             mid = (high+low) // 2
@@ -96,10 +103,15 @@ class MyDataset(Dataset):
         return low
     
     def _trans_tensor_PIL(self, img_tensor):
-        img_np = img_tensor.numpy()
-        img_np = img_np.transpose(1,2,0).astype(np.uint8)
-        img_np = np.squeeze(img_np, axis=2)
-        img_pil= Image.fromarray(img_np)
+        """
+        3, 127, 127
+        """
+        assert isinstance(img_tensor, torch.Tensor), 'input should be tensor'
+        #img_np = img_tensor.numpy()
+        #img_np = img_np.transpose(1,2,0).astype(np.uint8)
+        #img_pil= Image.fromarray(img_np)
+        img_pil = transforms.ToPILImage()(img_tensor).convert('RGB')
+        return img_pil
 
     def __getitem__(self, index):
         """
@@ -116,52 +128,68 @@ class MyDataset(Dataset):
         low = self._which(index, sum1)
         index -= sum1[low]
         folder = list1[low]
-        
-        ############# index ##########################
+        print('**Train** img folder <==> {:8} index <==> {:3}'.format(folder, index))
+
+        ############# template ##########################
         # 产生对应index的img instance
-        img = os.listdir(osp.join(self.root_dir, folder, 'img'))[index]
+        img_name_list = sorted(os.listdir(osp.join(self.root_dir, folder, 'img')))
+        img = img_name_list[index]
         img = Image.open(osp.join(self.root_dir, folder, 'img', img))
         img = img.convert('RGB') if not img.mode == 'RGB' else img
         
         # 产生对应index的gtbox instance
-        gtbox = os.listdir(osp.join(self.root_dir, folder, 'label'))[index]  #e.g. 00000090.txt
+        gtbox_name_list = sorted(os.listdir(osp.join(self.root_dir, folder, 'label')))
+        gtbox = gtbox_name_list[index]  #e.g. 00000090.txt
         with open(osp.join(self.root_dir, folder, 'label', gtbox)) as f:
-            gtbox = f.read().strip('\n').split(',')
+            gtbox = f.read().strip('\n')
+            print(gtbox)
+            gtbox = gtbox.split('\t') if gtbox.find(',') == -1 else gtbox.split(',')
         gtbox = [round(float(i)) for i in gtbox]
         gtbox = x1y1wh_to_xywh(gtbox)
+
         template, _, _ = self._transform(img, gtbox, 1, 127)
         
-        
-        ############## index + rand ##################
+
+        ############## detection###### ##################
         #从 1-100 中选取一个奇数 random.randrange(1, 100, 2)
         #从 1-interval中随便选取一个数
         rand = random.randrange(1, interval) 
-        img = os.listdir(osp.join(self.root_dir, folder, 'img'))[index + rand]
+        img_name_list = sorted(os.listdir(osp.join(self.root_dir, folder, 'img')))
+        img = img_name_list[index + rand]
         img = Image.open(osp.join(self.root_dir, folder, 'img', img))
         img = img.convert('RGB') if not img.mode == 'RGB' else img
         
-        gtbox = os.listdir(osp.join(self.root_dir, folder, 'label'))[index + rand]
+        gtbox_name_list = sorted(os.listdir(osp.join(self.root_dir, folder, 'label')))
+        gtbox = gtbox_name_list[index + rand]  #e.g. 00000090.txt
         with open(osp.join(self.root_dir, folder, 'label', gtbox)) as f:
-            gtbox = f.read().split(',')
+            gtbox = f.read().strip('\n')
+            gtbox = gtbox.split('\t') if gtbox.find(',') == -1 else gtbox.split(',')
         gtbox = [round(float(i)) for i in gtbox]
         gtbox = x1y1wh_to_xywh(gtbox)
         detection, pcc, ratio = self._transform(img, gtbox, 2, 255)
 
-        if vis and self.count < 1000:
-            path_tmplate = osp.join(self.save_dir, 'template__{}.jpg'.format(self.count))
-            path_detect  = osp.join(self.save_dir, 'detection_{}.jpg'.format(self.count))
+        a = (gtbox[2]+gtbox[3]) / 2.
+        a = math.sqrt((gtbox[2]+a)*(gtbox[3]+a)) * 2
+        gtbox = [127, 127, round(255*gtbox[2]/a), round(255*gtbox[3]/a)] #(center x, y, w, h)
+
+        if self.vis and self.count < 1000:
+            path_tmplate = osp.join(self.save_dir, '{:05d}_1_template.jpg'.format(self.count))
+            path_detect  = osp.join(self.save_dir, '{:05d}_2_detection.jpg'.format(self.count))
+            path_origin  = osp.join(self.save_dir, '{:05d}_3_origin.jpg'.format(self.count))
 
             template = self._trans_tensor_PIL(template)
             detect = self._trans_tensor_PIL(detection)
+            
+            # gtbox是在detection 255 * 255 上的中心坐标,w,h
+            # origin
+            origin = detect.copy()
+            draw = ImageDraw.Draw(origin)
+            draw.rectangle([gtbox[0]-gtbox[2]//2 , gtbox[1]-gtbox[3]//2, gtbox[0]+gtbox[2]//2, gtbox[1]+gtbox[3]//2])
 
             template.save(path_tmplate)
             detect.save(path_detect)
-
+            origin.save(path_origin)
             self.count += 1
-
-        a = (gtbox[2]+gtbox[3]) / 2.
-        a = math.sqrt((gtbox[2]+a)*(gtbox[3]+a)) * 2
-        gtbox = [127, 127, round(255*gtbox[2]/a), round(255*gtbox[3]/a)]
 
         # clabel (5, 17, 17)
         # rlabel (20,17, 17)
@@ -184,6 +212,7 @@ class MyDataset(Dataset):
         
     def _gtbox_to_label(self, gtbox):
         """
+        只输入一个gtbox
         clabel -- [5, 17, 17]
         rlabel -- [20, 17, 17]
         """
@@ -263,6 +292,10 @@ class MyDataset(Dataset):
         return np.array(pos), np.array(neg)
 
     def _IOU(self, a, b):
+        """
+        输入的gtbox是(中心坐标，w, h)
+        生成的anchor并不是针对原图而是针对255*255
+        """
         b = xywh_to_x1y1x2y2(b)
         sa = (a[2] - a[0]) * (a[3] - a[1]) 
         sb = (b[2] - b[0]) * (b[3] - b[1])
@@ -271,34 +304,22 @@ class MyDataset(Dataset):
         area = w * h 
         return area / (sa + sb - area)
 
-#%%
+
 transformed_dataset_train = MyDataset(root_dir = data_dir, vis = True)
 train_dataloader = DataLoader(transformed_dataset_train, batch_size=1, shuffle=True, num_workers=0)
 dataloader = {'train':train_dataloader, 'valid':train_dataloader}
 
-#transformed_dataset_test = MyDataset(detection_root_dir = './lq/JPEGImages/', 
-#                                gtbox_root_dir = './lq/label/')
-#test_dataloader = DataLoader(transformed_dataset_train, batch_size=1, shuffle=False, num_workers=0)
-#%%
-#with open('./vot2015/bag/groundtruth.txt') as f:
-#    a = f.read().split()
-#b = [float(i) for i in a[0].split(',')]
-#x = (b[0]+b[4]) / 2.
-#y = (b[1]+b[5]) / 2.
-#w = 1.1 * math.sqrt(math.sqrt(((b[0]-b[2])**2+(b[1]-b[3])**2) * ((b[2]-b[4])**2+(b[3]-b[5])**2)))
-#h = w
-#if (b[0]-b[2]) >= (b[1]-b[3]):
-#    w = (b[0]-b[2])
-#
-#list1 = xywh_to_x1y1x2y2([x, y, w, h])
-#list1 = os.listdir('./vot2015')
-#number = [len(os.listdir('./vot2015/'+item)) for item in os.listdir('./vot2015')]
+"""
+TODO：
+不要把gt放在每个加载图片的中间
+可以做成随机包含这个图片的区域
 
+为什么gt不是框住所有的object
+"""
 if __name__ == '__main__':
     print('Do a test for dataloader')
-    print('length', transformed_dataset_train.__len__())
-    len = transformed_dataset_train.__len__()
-    for i in range(len):
+    length = transformed_dataset_train.__len__()
+    for i in range(length):
         transformed_dataset_train.__getitem__(i)
 
 
